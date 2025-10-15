@@ -152,6 +152,17 @@ def diag_embed():
     except Exception as e:
         logger.exception("Embed diag failed")
         return {"ok": False, "error": repr(e)}
+    
+@app.get("/_diag/faiss")
+def diag_faiss():
+    return {
+        "ok": True,
+        "index_d": int(index.d),
+        "index_ntotal": int(index.ntotal),
+        "index_type": type(index).__name__,
+        "is_trained": bool(getattr(index, "is_trained", True)),
+        "embed_model": EMBED_MODEL,
+    }
 
 # ---------- Main chat ----------
 @app.post("/chat", response_model=ChatOut)
