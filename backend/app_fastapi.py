@@ -4,8 +4,7 @@
 # (Embeddings via OpenAI to keep the deploy image small)
 # ============================================================
 
-# --- top imports (ensure these exist) ---
-import os, json, pathlib, re, traceback
+import os, json, pathlib, re, traceback, logging
 from typing import Optional, List, Dict
 
 import numpy as np
@@ -22,6 +21,10 @@ from tech_helper import answer_technical_expertise, is_tech_question
 from outcomes_helper import answer_outcomes_detailed, is_outcomes_question
 from aiprojects_helper import is_ai_projects_question, answer_ai_projects
 
+# ================= Logging =================
+logger = logging.getLogger("sayali_rag")
+logger.setLevel(logging.INFO)
+
 # ================= Config =================
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 load_dotenv(dotenv_path=str(BASE_DIR / ".env"))  # load backend/.env explicitly
@@ -36,7 +39,7 @@ META_JSON   = INDEX_DIR / "meta.json"
 DOCX_PATH   = str(DATA_DIR / "Resume_RAG_Optimized_Sayali_Sawant.docx")
 
 # ================= Load Index =================
-print("[RAG] Loading FAISS/chunks…")
+logger.info("[RAG] Loading FAISS/chunks…")
 chunks = json.loads(CHUNKS_JSON.read_text(encoding="utf-8"))
 index = faiss.read_index(str(FAISS_FILE))
 
@@ -44,7 +47,7 @@ meta_obj = json.loads(META_JSON.read_text(encoding="utf-8"))
 chunks_meta = meta_obj.get("chunks_meta", [])
 sources = [m.get("source", "") for m in chunks_meta] if len(chunks_meta) == len(chunks) else [""] * len(chunks)
 
-# embedding model name persisted by prepare_docs.py (falls back to OpenAI small)
+# Embedding model name persisted by prepare_docs.py (fallback to OpenAI small)
 EMBED_MODEL = meta_obj.get("embed_model", "text-embedding-3-small")
 
 # ================= OpenAI client =================
@@ -62,6 +65,7 @@ def _postclean(text: str) -> str:
 
 def embed_query(q: str) -> np.ndarray:
     """Embed a query with OpenAI and L2-normalize to match FAISS index."""
+    # Any error here (bad key, model name, networking) should be visible
     e = client.embeddings.create(model=EMBED_MODEL, input=q)
     v = np.array(e.data[0].embedding, dtype=np.float32)
     n = np.linalg.norm(v)
@@ -107,12 +111,13 @@ Assistant:
         )
         return _postclean(resp.choices[0].message.content.strip())
     except Exception as e:
-        return f"Error calling OpenAI API: {e}"
+        # Return explicit error text to help debugging
+        return f"Error calling OpenAI API: {repr(e)}"
 
 # ================= FastAPI =================
 app = FastAPI(title="Sayali RAG API")
 
-# CORS (allow Netlify preview + localhost; restrict later to your domains)
+# CORS (allow Netlify + localhost; restrict later to your domains)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -129,6 +134,26 @@ class ChatOut(BaseModel):
     answer: str
     sources: List[Dict] = []
 
+# ---------- Diagnostics ----------
+@app.get("/_diag")
+def diag():
+    return {
+        "ok": True,
+        "index_ntotal": int(index.ntotal),
+        "embed_model": EMBED_MODEL,
+        "has_api_key": bool(OPENAI_API_KEY),
+    }
+
+@app.get("/_diag/embed")
+def diag_embed():
+    try:
+        vec = embed_query("hello world")
+        return {"ok": True, "dim": int(vec.shape[1])}
+    except Exception as e:
+        logger.exception("Embed diag failed")
+        return {"ok": False, "error": repr(e)}
+
+# ---------- Main chat ----------
 @app.post("/chat", response_model=ChatOut)
 def chat(body: ChatIn):
     q = (body.query or "").strip()
@@ -139,7 +164,7 @@ def chat(body: ChatIn):
         if GREETING_RE.match(q):
             return ChatOut(answer="Hi! How can I help you with my projects, skills, or experience?", sources=[])
 
-        # special routes (helpers read the DOCX directly)
+        # Special routes (helpers read the DOCX directly)
         if is_outcomes_question(q):
             return ChatOut(answer=answer_outcomes_detailed(q, DOCX_PATH), sources=[])
         if is_tech_question(q):
@@ -149,7 +174,7 @@ def chat(body: ChatIn):
         if is_ai_projects_question(q):
             return ChatOut(answer=answer_ai_projects(q, DOCX_PATH), sources=[])
 
-        # ----- default RAG over FAISS chunks (hardened) -----
+        # Default RAG over FAISS chunks
         hits = search(q, k=min(max(int(body.k or 5), 1), 10))
         if not hits:
             return ChatOut(
@@ -157,33 +182,30 @@ def chat(body: ChatIn):
                 sources=[],
             )
 
-        # Guard against None / non-string text fields
+        # Harden context building (guard against None / non-str)
         def safe_text(h):
             t = h.get("text")
             return t if isinstance(t, str) else ""
 
         top_texts = [safe_text(h)[:600] for h in hits[:3] if safe_text(h)]
         context = "\n\n---\n\n".join(top_texts).strip()
-
         if not context:
-            # No usable text in the top hits — avoid calling OpenAI
             return ChatOut(
                 answer="I couldn’t assemble enough context from my docs to answer that. Try rephrasing or ask about my work/skills.",
                 sources=[],
             )
 
         ans = generate_answer(q, context).strip()
-
         simple_sources = [
             {"title": h.get("source") or "chunk", "url": "", "score": h.get("score", 0.0)}
             for h in hits[:3]
         ]
-
         return ChatOut(answer=ans or "Sorry, I couldn’t produce an answer.", sources=simple_sources)
 
     except Exception as e:
-        traceback.print_exc()
-        return ChatOut(answer=f"Sorry—answering failed: {e}", sources=[])
+        # Log full traceback to Railway logs and surface the error text
+        logger.exception("Chat failed")
+        return ChatOut(answer=f"Sorry—answering failed: {repr(e)}", sources=[])
 
 @app.get("/")
 def root():
