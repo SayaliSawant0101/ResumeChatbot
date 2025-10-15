@@ -149,15 +149,29 @@ def chat(body: ChatIn):
         if is_ai_projects_question(q):
             return ChatOut(answer=answer_ai_projects(q, DOCX_PATH), sources=[])
 
-        # default RAG over FAISS chunks
+        # ----- default RAG over FAISS chunks (hardened) -----
         hits = search(q, k=min(max(int(body.k or 5), 1), 10))
         if not hits:
             return ChatOut(
-                answer="I couldn't find that in my documents, but I’m happy to clarify if you share more details.",
+                answer="I couldn’t find that in my documents, but I’m happy to clarify if you share more details.",
                 sources=[],
             )
 
-        context = "\n\n---\n\n".join(h["text"][:600] for h in hits[:3])
+        # Guard against None / non-string text fields
+        def safe_text(h):
+            t = h.get("text")
+            return t if isinstance(t, str) else ""
+
+        top_texts = [safe_text(h)[:600] for h in hits[:3] if safe_text(h)]
+        context = "\n\n---\n\n".join(top_texts).strip()
+
+        if not context:
+            # No usable text in the top hits — avoid calling OpenAI
+            return ChatOut(
+                answer="I couldn’t assemble enough context from my docs to answer that. Try rephrasing or ask about my work/skills.",
+                sources=[],
+            )
+
         ans = generate_answer(q, context).strip()
 
         simple_sources = [
@@ -165,7 +179,8 @@ def chat(body: ChatIn):
             for h in hits[:3]
         ]
 
-        return ChatOut(answer=ans or "Sorry, I couldn't produce an answer.", sources=simple_sources)
+        return ChatOut(answer=ans or "Sorry, I couldn’t produce an answer.", sources=simple_sources)
+
     except Exception as e:
         traceback.print_exc()
         return ChatOut(answer=f"Sorry—answering failed: {e}", sources=[])
