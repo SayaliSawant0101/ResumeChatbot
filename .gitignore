@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Python (only the venv & caches)
+backend/.venv/
+**/__pycache__/
+*.pyc
+
+# Node (frontend)
+web/node_modules/
+web/.vite/
+web/dist/
+
+# Local env files (never commit secrets)
+backend/.env
+web/.env.local
+.env
+.env.*
+
+# Netlify local folder
+.netlify/
+
+# Logs
+*.log
+
