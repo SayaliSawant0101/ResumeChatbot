@@ -1,32 +1,34 @@
 # backend/app_fastapi.py
+# ============================================================
+# Sayali RAG API — FastAPI backend using FAISS + OpenAI
+# (Embeddings via OpenAI to keep the deploy image small)
+# ============================================================
+
+# --- top imports (ensure these exist) ---
 import os, json, pathlib, re, traceback
 from typing import Optional, List, Dict
 
+import numpy as np
+import faiss
 from dotenv import load_dotenv
-BASE_DIR = pathlib.Path(__file__).resolve().parent
-load_dotenv(dotenv_path=str(BASE_DIR / ".env"))  # load backend/.env explicitly
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-import numpy as np
-import faiss
-from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
-# ---- Your helpers (unchanged) ----
+# ---- helper routes (your files) ----
 from workexp_helper import answer_work_experience, is_workexp_question
 from tech_helper import answer_technical_expertise, is_tech_question
 from outcomes_helper import answer_outcomes_detailed, is_outcomes_question
 from aiprojects_helper import is_ai_projects_question, answer_ai_projects
 
-
 # ================= Config =================
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+load_dotenv(dotenv_path=str(BASE_DIR / ".env"))  # load backend/.env explicitly
+
 INDEX_DIR   = BASE_DIR / "rag_index"
 DATA_DIR    = BASE_DIR / "data" / "docs"
 
-EMBED_ID    = "sentence-transformers/all-MiniLM-L6-v2"  # must match prepare_docs.py
 FAISS_FILE  = INDEX_DIR / "faiss.index"
 CHUNKS_JSON = INDEX_DIR / "chunks.json"
 META_JSON   = INDEX_DIR / "meta.json"
@@ -37,31 +39,48 @@ DOCX_PATH   = str(DATA_DIR / "Resume_RAG_Optimized_Sayali_Sawant.docx")
 print("[RAG] Loading FAISS/chunks…")
 chunks = json.loads(CHUNKS_JSON.read_text(encoding="utf-8"))
 index = faiss.read_index(str(FAISS_FILE))
+
 meta_obj = json.loads(META_JSON.read_text(encoding="utf-8"))
 chunks_meta = meta_obj.get("chunks_meta", [])
 sources = [m.get("source", "") for m in chunks_meta] if len(chunks_meta) == len(chunks) else [""] * len(chunks)
 
-# ================= Embedder =================
-print("[RAG] Loading embedder:", EMBED_ID)
-embedder = SentenceTransformer(EMBED_ID)
-emb_dim = embedder.get_sentence_embedding_dimension()
-assert emb_dim == index.d, f"Embed dim {emb_dim} != FAISS dim {index.d}. Rebuild index with {EMBED_ID}."
+# embedding model name persisted by prepare_docs.py (falls back to OpenAI small)
+EMBED_MODEL = meta_obj.get("embed_model", "text-embedding-3-small")
 
 # ================= OpenAI client =================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY missing. Put it in backend/.env or your hosting env.")
-try:
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)   # 1.x
-except TypeError:
-    client = OpenAI(apiKey=OPENAI_API_KEY)    # 2.x
+    raise RuntimeError("OPENAI_API_KEY missing (set in backend/.env locally or in Railway Variables).")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ================= Utils =================
 GREETING_RE = re.compile(r"^\s*(hi|hello|hey)\b", re.I)
 
 def _postclean(text: str) -> str:
+    # Trim any boilerplate sections if the model adds them
     return re.sub(r"(?is)\b(Sources?|Context|Question|Instructions)\s*:.*", "", text or "").strip()
+
+def embed_query(q: str) -> np.ndarray:
+    """Embed a query with OpenAI and L2-normalize to match FAISS index."""
+    e = client.embeddings.create(model=EMBED_MODEL, input=q)
+    v = np.array(e.data[0].embedding, dtype=np.float32)
+    n = np.linalg.norm(v)
+    if n:
+        v = v / n
+    return v.reshape(1, -1)
+
+def search(query: str, k: int = 8):
+    q = embed_query(query)                  # shape: (1, d) where d == index.d
+    D, I = index.search(q, k)
+    results = []
+    for rank, idx in enumerate(I[0]):
+        if 0 <= idx < len(chunks):
+            results.append({
+                "text":   chunks[idx],
+                "source": sources[idx] if idx < len(sources) else "",
+                "score":  float(D[0][rank]),
+            })
+    return results
 
 def generate_answer(question: str, context: str) -> str:
     prompt = f"""
@@ -89,21 +108,6 @@ Assistant:
         return _postclean(resp.choices[0].message.content.strip())
     except Exception as e:
         return f"Error calling OpenAI API: {e}"
-
-def search(query: str, k: int = 8):
-    q = embedder.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
-    D, I = index.search(q, k)
-    results = []
-    for rank, idx in enumerate(I[0]):
-        if 0 <= idx < len(chunks):
-            results.append(
-                {
-                    "text": chunks[idx],
-                    "source": sources[idx] if idx < len(sources) else "",
-                    "score": float(D[0][rank]),
-                }
-            )
-    return results
 
 # ================= FastAPI =================
 app = FastAPI(title="Sayali RAG API")
@@ -135,7 +139,7 @@ def chat(body: ChatIn):
         if GREETING_RE.match(q):
             return ChatOut(answer="Hi! How can I help you with my projects, skills, or experience?", sources=[])
 
-        # your three special routes (unchanged logic)
+        # special routes (helpers read the DOCX directly)
         if is_outcomes_question(q):
             return ChatOut(answer=answer_outcomes_detailed(q, DOCX_PATH), sources=[])
         if is_tech_question(q):
@@ -144,7 +148,6 @@ def chat(body: ChatIn):
             return ChatOut(answer=answer_work_experience(q, DOCX_PATH), sources=[])
         if is_ai_projects_question(q):
             return ChatOut(answer=answer_ai_projects(q, DOCX_PATH), sources=[])
-
 
         # default RAG over FAISS chunks
         hits = search(q, k=min(max(int(body.k or 5), 1), 10))
